@@ -2,5 +2,3 @@ fastapi
 mangum
 boto3
 pydantic
-uvicorn
-python-multipart

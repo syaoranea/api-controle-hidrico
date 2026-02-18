@@ -1,165 +1,94 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
-from uuid import uuid4, UUID
 from mangum import Mangum
 import boto3
 import os
-import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
-# Configuração de logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+app = FastAPI()
 
-app = FastAPI(
-    title="API de Controle Hídrico",
-    description="API para gerenciar o controle hídrico e prever cateterismo.",
-    version="1.0.0"
+# Inicialização global do DynamoDB
+dynamodb = boto3.resource(
+    "dynamodb",
+    region_name=os.environ.get("AWS_REGION", "us-east-1")
 )
+table_registros = dynamodb.Table("controleHidrico")
 
-# Inicialização do DynamoDB
-try:
-    # O boto3 busca automaticamente as variáveis AWS_ACCESS_KEY_ID e AWS_SECRET_ACCESS_KEY do ambiente
-    dynamodb = boto3.resource(
-        "dynamodb",
-        region_name=os.environ.get("AWS_REGION", "us-east-1")
+@app.get("/healthcheck")
+def healthcheck():
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+@app.get("/")
+def raiz():
+    return {"mensagem": "API Controle Hidrico Online"}
+
+def buscar_historico(user_id: str, limit: int = 200):
+    response = table_registros.query(
+        KeyConditionExpression="PK = :pk",
+        ExpressionAttributeValues={":pk": f"USER#{user_id}"},
+        Limit=limit,
+        ScanIndexForward=False
     )
-    table_registros = dynamodb.Table("controleHidrico")
-    table_parametros = dynamodb.Table("tb_parametros_paciente")
-    table_usuarios = dynamodb.Table("tb_usuarios_controle_hidrico")
-    logger.info("Conexão com DynamoDB inicializada.")
-except Exception as e:
-    logger.error(f"Erro ao configurar DynamoDB: {str(e)}")
+    items = response.get("Items", [])
+    for item in items:
+        for key, value in item.items():
+            if hasattr(value, 'to_eng_string'):
+                item[key] = float(value)
+    return items
 
-@app.get("/healthcheck", tags=["Geral"])
-async def healthcheck():
-    aws_configured = all([
-        os.environ.get("AWS_ACCESS_KEY_ID"),
-        os.environ.get("AWS_SECRET_ACCESS_KEY"),
-        os.environ.get("AWS_REGION")
-    ])
-    return {
-        "status": "ok", 
-        "timestamp": datetime.utcnow().isoformat(),
-        "aws_configured": aws_configured
-    }
-
-@app.get("/", tags=["Geral"])
-async def raiz():
-    return {"mensagem": "Bem-vindo à API de Controle Hídrico!"}
-
-def buscar_historico(user_id: str, limit: int = 200) -> List[dict]:
-    try:
-        response = table_registros.query(
-            KeyConditionExpression="PK = :pk",
-            ExpressionAttributeValues={":pk": f"USER#{user_id}"},
-            Limit=limit,
-            ScanIndexForward=False
-        )
-        items = response.get("Items", [])
-        
-        # Converter Decimal para float sem usar Pandas
-        for item in items:
-            for key, value in item.items():
-                if hasattr(value, 'to_eng_string'):
-                    item[key] = float(value)
-        return items
-    except Exception as e:
-        logger.error(f"Erro ao buscar histórico: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erro ao acessar DynamoDB: {str(e)}")
-
-def calcular_previsao_cateterismo(registros: List[dict]) -> Optional[dict]:
-    if not registros:
-        return None
-
-    # Ordenar registros por horário (Python puro)
-    try:
-        registros_ordenados = sorted(
-            registros, 
-            key=lambda x: datetime.fromisoformat(x['horario'].replace('Z', '+00:00'))
-        )
-    except Exception as e:
-        logger.error(f"Erro ao ordenar registros: {str(e)}")
-        return None
-
-    cateterismos = []
-    for i, registro in enumerate(registros_ordenados):
-        if registro.get('urineType') == 1:
-            cateterismos.append({
-                'index': i, 
-                'horario': datetime.fromisoformat(registro['horario'].replace('Z', '+00:00'))
-            })
-
-    if len(cateterismos) < 2:
-        return None
-
-    intervalos_liquido = []
-    for i in range(len(cateterismos) - 1):
-        start_index = cateterismos[i]['index']
-        end_index = cateterismos[i+1]['index']
-        
-        liquido_consumido = 0
-        for j in range(start_index, end_index):
-            liquido_consumido += float(registros_ordenados[j].get('quantidadeLiquidoM', 0) or 0)
-        intervalos_liquido.append(liquido_consumido)
-
-    if not intervalos_liquido:
-        return None
-
-    media_liquido_entre_cateterismos = sum(intervalos_liquido) / len(intervalos_liquido)
-
-    ultimo_cateterismo_index = cateterismos[-1]['index']
-    liquido_desde_ultimo_cateterismo = 0
-    for i in range(ultimo_cateterismo_index, len(registros_ordenados)):
-        liquido_desde_ultimo_cateterismo += float(registros_ordenados[i].get('quantidadeLiquidoM', 0) or 0)
-
-    liquido_restante = media_liquido_entre_cateterismos - liquido_desde_ultimo_cateterismo
-
-    if liquido_restante <= 0:
-        return {
-            "previsao": "Cateterismo iminente ou já deveria ter ocorrido.", 
-            "liquido_restante_ml": 0,
-            "media_liquido_ml": round(media_liquido_entre_cateterismos, 2)
-        }
-
-    duracoes_cateterismo = []
-    for i in range(len(cateterismos) - 1):
-        duracao = cateterismos[i+1]['horario'] - cateterismos[i]['horario']
-        duracoes_cateterismo.append(duracao.total_seconds())
+def calcular_previsao(registros: List[dict]):
+    if not registros: return None
     
-    media_duracao_segundos = sum(duracoes_cateterismo) / len(duracoes_cateterismo) if duracoes_cateterismo else 0
+    try:
+        regs = sorted(registros, key=lambda x: x['horario'])
+    except:
+        return None
 
-    if media_duracao_segundos == 0:
-        return {"previsao": "Dados de duração insuficientes.", "liquido_restante_ml": liquido_restante}
+    cateterismos = [i for i, r in enumerate(regs) if r.get('urineType') == 1]
+    if len(cateterismos) < 2: return None
 
-    taxa_ingestao_ml_por_segundo = media_liquido_entre_cateterismos / media_duracao_segundos
+    intervalos = []
+    for i in range(len(cateterismos) - 1):
+        idx_start, idx_end = cateterismos[i], cateterismos[i+1]
+        vol = sum(float(regs[j].get('quantidadeLiquidoM', 0) or 0) for j in range(idx_start, idx_end))
+        intervalos.append(vol)
 
-    if taxa_ingestao_ml_por_segundo <= 0:
-        return {"previsao": "Taxa de ingestão inválida.", "liquido_restante_ml": liquido_restante}
-
-    tempo_restante_segundos = liquido_restante / taxa_ingestao_ml_por_segundo
-    tempo_restante_timedelta = timedelta(seconds=tempo_restante_segundos)
-    proximo_horario_previsto = cateterismos[-1]['horario'] + tempo_restante_timedelta
+    media_vol = sum(intervalos) / len(intervalos)
+    
+    # Ingestão desde o último
+    idx_last = cateterismos[-1]
+    vol_desde_last = sum(float(regs[j].get('quantidadeLiquidoM', 0) or 0) for j in range(idx_last, len(regs)))
+    
+    restante = media_vol - vol_desde_last
+    
+    # Cálculo de tempo simplificado
+    t_last = datetime.fromisoformat(regs[idx_last]['horario'].replace('Z', '+00:00'))
+    t_first_cat = datetime.fromisoformat(regs[cateterismos[0]]['horario'].replace('Z', '+00:00'))
+    total_sec = (t_last - t_first_cat).total_seconds()
+    
+    if total_sec <= 0: return {"previsao": "Dados insuficientes", "liquido_restante_ml": restante}
+    
+    taxa = media_vol / (total_sec / (len(cateterismos) - 1)) if len(cateterismos) > 1 else 0
+    
+    if taxa <= 0: return {"previsao": "Aguardando mais dados", "liquido_restante_ml": restante}
+    
+    sec_restante = restante / (taxa / 3600) # ml por hora
+    previsao_hora = t_last + timedelta(seconds=sec_restante)
 
     return {
-        "previsao": "Tempo estimado para o próximo cateterismo",
-        "tempo_restante": str(tempo_restante_timedelta),
-        "proximo_horario_previsto": proximo_horario_previsto.isoformat(),
-        "liquido_restante_ml": round(liquido_restante, 2),
-        "media_liquido_entre_cateterismos_ml": round(media_liquido_entre_cateterismos, 2)
+        "tempo_restante_aprox": str(timedelta(seconds=sec_restante)),
+        "proximo_horario": previsao_hora.isoformat(),
+        "liquido_restante_ml": round(restante, 2),
+        "media_historica_ml": round(media_vol, 2)
     }
 
-@app.get("/prever-cateterismo/{user_id}", tags=["Previsão"])
-async def prever_cateterismo(user_id: str):
-    registros = buscar_historico(user_id, limit=200)
-    if not registros:
-        raise HTTPException(status_code=404, detail="Nenhum registro encontrado para o usuário.")
-    
-    previsao = calcular_previsao_cateterismo(registros)
-    if previsao is None:
-        raise HTTPException(status_code=404, detail="Não há dados suficientes para prever o cateterismo.")
-    
-    return previsao
+@app.get("/prever-cateterismo/{user_id}")
+def prever(user_id: str):
+    regs = buscar_historico(user_id)
+    if not regs: raise HTTPException(status_code=404, detail="Sem registros")
+    res = calcular_previsao(regs)
+    if not res: raise HTTPException(status_code=400, detail="Dados insuficientes")
+    return res
 
 handler = Mangum(app)
