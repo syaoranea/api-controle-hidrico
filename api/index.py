@@ -2,14 +2,13 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
 from uuid import uuid4, UUID
-import pandas as pd
 from mangum import Mangum
 import boto3
 import os
 import logging
 from datetime import datetime, timedelta, timezone
 
-# Configuração de logging para ver erros no console da Vercel
+# Configuração de logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -19,25 +18,22 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Inicialização do DynamoDB com tratamento de erro
+# Inicialização do DynamoDB
 try:
+    # O boto3 busca automaticamente as variáveis AWS_ACCESS_KEY_ID e AWS_SECRET_ACCESS_KEY do ambiente
     dynamodb = boto3.resource(
         "dynamodb",
-        region_name=os.environ.get("AWS_REGION", "us-east-1"),
-        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY")
+        region_name=os.environ.get("AWS_REGION", "us-east-1")
     )
     table_registros = dynamodb.Table("controleHidrico")
     table_parametros = dynamodb.Table("tb_parametros_paciente")
     table_usuarios = dynamodb.Table("tb_usuarios_controle_hidrico")
-    logger.info("Conexão com DynamoDB configurada.")
+    logger.info("Conexão com DynamoDB inicializada.")
 except Exception as e:
     logger.error(f"Erro ao configurar DynamoDB: {str(e)}")
-    # Não levantamos erro aqui para permitir que o app inicie e mostre erros nos endpoints
 
 @app.get("/healthcheck", tags=["Geral"])
 async def healthcheck():
-    # Verifica se as variáveis de ambiente estão presentes
     aws_configured = all([
         os.environ.get("AWS_ACCESS_KEY_ID"),
         os.environ.get("AWS_SECRET_ACCESS_KEY"),
@@ -62,10 +58,11 @@ def buscar_historico(user_id: str, limit: int = 200) -> List[dict]:
             ScanIndexForward=False
         )
         items = response.get("Items", [])
-        # Converter Decimal para float
+        
+        # Converter Decimal para float sem usar Pandas
         for item in items:
             for key, value in item.items():
-                if hasattr(value, 'to_eng_string'): # Checa se é Decimal sem importar
+                if hasattr(value, 'to_eng_string'):
                     item[key] = float(value)
         return items
     except Exception as e:
@@ -76,9 +73,12 @@ def calcular_previsao_cateterismo(registros: List[dict]) -> Optional[dict]:
     if not registros:
         return None
 
-    # Ordenar registros por horário
+    # Ordenar registros por horário (Python puro)
     try:
-        registros_ordenados = sorted(registros, key=lambda x: datetime.fromisoformat(x['horario'].replace('Z', '+00:00')))
+        registros_ordenados = sorted(
+            registros, 
+            key=lambda x: datetime.fromisoformat(x['horario'].replace('Z', '+00:00'))
+        )
     except Exception as e:
         logger.error(f"Erro ao ordenar registros: {str(e)}")
         return None
@@ -86,7 +86,10 @@ def calcular_previsao_cateterismo(registros: List[dict]) -> Optional[dict]:
     cateterismos = []
     for i, registro in enumerate(registros_ordenados):
         if registro.get('urineType') == 1:
-            cateterismos.append({'index': i, 'horario': datetime.fromisoformat(registro['horario'].replace('Z', '+00:00'))})
+            cateterismos.append({
+                'index': i, 
+                'horario': datetime.fromisoformat(registro['horario'].replace('Z', '+00:00'))
+            })
 
     if len(cateterismos) < 2:
         return None
@@ -114,7 +117,11 @@ def calcular_previsao_cateterismo(registros: List[dict]) -> Optional[dict]:
     liquido_restante = media_liquido_entre_cateterismos - liquido_desde_ultimo_cateterismo
 
     if liquido_restante <= 0:
-        return {"previsao": "Cateterismo iminente ou já deveria ter ocorrido.", "liquido_restante_ml": 0}
+        return {
+            "previsao": "Cateterismo iminente ou já deveria ter ocorrido.", 
+            "liquido_restante_ml": 0,
+            "media_liquido_ml": round(media_liquido_entre_cateterismos, 2)
+        }
 
     duracoes_cateterismo = []
     for i in range(len(cateterismos) - 1):
