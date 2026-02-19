@@ -32,7 +32,7 @@ def healthcheck():
 
 @app.get("/")
 def raiz():
-    return {"mensagem": "API Controle Hidrico Online - Correção de Ordenação"}
+    return {"mensagem": "API Controle Hidrico Online - Campos Corrigidos"}
 
 def buscar_historico(user_id: str, limit: int = 200):
     logger.info(f"Buscando histórico para o usuário: {user_id}")
@@ -58,24 +58,25 @@ def buscar_historico(user_id: str, limit: int = 200):
 
 def calcular_previsao(registros: List[dict]):
     if not registros:
-        logger.warning("Nenhum registro para cálculo.")
         return None
     
-    # FILTRAGEM: Manter apenas registros que possuem o campo 'horario'
-    regs_validos = [r for r in registros if 'horario' in r and r['horario']]
-    logger.info(f"Registros com campo 'horario' válido: {len(regs_validos)} de {len(registros)}")
+    # Ajuste dos nomes dos campos conforme logs: 'timestamp' e 'quantidadeLiquidoMl'
+    campo_data = 'timestamp'
+    campo_liquido = 'quantidadeLiquidoMl'
+    
+    # FILTRAGEM: Manter apenas registros que possuem o campo de data
+    regs_validos = [r for r in registros if campo_data in r and r[campo_data]]
+    logger.info(f"Registros com campo '{campo_data}' válido: {len(regs_validos)} de {len(registros)}")
 
     if not regs_validos:
-        if registros:
-            logger.error(f"Exemplo de campos no primeiro registro: {list(registros[0].keys())}")
         return None
 
     try:
         # Ordenação cronológica
-        regs = sorted(regs_validos, key=lambda x: x['horario'])
-        logger.info(f"Ordenação concluída. Primeiro: {regs[0]['horario']}, Último: {regs[-1]['horario']}")
+        regs = sorted(regs_validos, key=lambda x: x[campo_data])
+        logger.info(f"Ordenação concluota. Primeiro: {regs[0][campo_data]}, Último: {regs[-1][campo_data]}")
     except Exception as e:
-        logger.error(f"Erro fatal na ordenação: {str(e)}")
+        logger.error(f"Erro na ordenação: {str(e)}")
         return None
 
     # Identificar cateterismos (urineType = 1)
@@ -90,24 +91,33 @@ def calcular_previsao(registros: List[dict]):
     intervalos_vol = []
     for i in range(len(cateterismos) - 1):
         idx_start, idx_end = cateterismos[i], cateterismos[i+1]
-        vol = sum(float(regs[j].get('quantidadeLiquidoM', 0) or 0) for j in range(idx_start, idx_end))
+        vol = sum(float(regs[j].get(campo_liquido, 0) or 0) for j in range(idx_start, idx_end))
         intervalos_vol.append(vol)
 
     media_vol = sum(intervalos_vol) / len(intervalos_vol)
     
     # Ingestão desde o último cateterismo
     idx_last_cat = cateterismos[-1]
-    vol_desde_ultimo = sum(float(regs[j].get('quantidadeLiquidoM', 0) or 0) for j in range(idx_last_cat, len(regs)))
+    vol_desde_ultimo = sum(float(regs[j].get(campo_liquido, 0) or 0) for j in range(idx_last_cat, len(regs)))
     
     restante = media_vol - vol_desde_ultimo
     
     try:
         # Tratamento de data flexível
         def parse_date(date_str):
-            return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+            # Tenta lidar com timestamps numéricos ou strings ISO
+            try:
+                if isinstance(date_str, (int, float)):
+                    return datetime.fromtimestamp(date_str)
+                return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+            except:
+                # Fallback para timestamp em milissegundos se for um número muito grande
+                if isinstance(date_str, (int, float)) and date_str > 1e11:
+                    return datetime.fromtimestamp(date_str / 1000)
+                raise
 
-        t_last_cat = parse_date(regs[idx_last_cat]['horario'])
-        t_first_cat = parse_date(regs[cateterismos[0]]['horario'])
+        t_last_cat = parse_date(regs[idx_last_cat][campo_data])
+        t_first_cat = parse_date(regs[cateterismos[0]][campo_data])
         
         total_sec = (t_last_cat - t_first_cat).total_seconds()
         num_intervalos = len(cateterismos) - 1
@@ -131,7 +141,9 @@ def calcular_previsao(registros: List[dict]):
             "debug": {
                 "total_processados": len(regs),
                 "cateterismos_encontrados": len(cateterismos),
-                "vol_desde_ultimo": vol_desde_ultimo
+                "vol_desde_ultimo": vol_desde_ultimo,
+                "campo_data_usado": campo_data,
+                "campo_liquido_usado": campo_liquido
             }
         }
     except Exception as e:
@@ -147,6 +159,6 @@ def prever(user_id: str):
     
     res = calcular_previsao(regs)
     if not res:
-        raise HTTPException(status_code=400, detail="Dados insuficientes (necessário pelo menos 2 cateterismos com campo 'horario').")
+        raise HTTPException(status_code=400, detail="Dados insuficientes (necessário pelo menos 2 cateterismos com campo 'timestamp').")
     
     return res
