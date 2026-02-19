@@ -6,7 +6,7 @@ import os
 import logging
 from datetime import datetime, timedelta
 
-# Configuração de logging para aparecer no console da Vercel
+# Configuração de logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api-controle-hidrico")
 
@@ -32,7 +32,7 @@ def healthcheck():
 
 @app.get("/")
 def raiz():
-    return {"mensagem": "API Controle Hidrico Online com Logs Detalhados"}
+    return {"mensagem": "API Controle Hidrico Online - Correção de Ordenação"}
 
 def buscar_historico(user_id: str, limit: int = 200):
     logger.info(f"Buscando histórico para o usuário: {user_id}")
@@ -44,8 +44,9 @@ def buscar_historico(user_id: str, limit: int = 200):
             ScanIndexForward=False
         )
         items = response.get("Items", [])
-        logger.info(f"Registros encontrados no DynamoDB: {len(items)}")
+        logger.info(f"Registros brutos encontrados: {len(items)}")
         
+        # Converter Decimal para float
         for item in items:
             for key, value in item.items():
                 if hasattr(value, 'to_eng_string'):
@@ -57,23 +58,32 @@ def buscar_historico(user_id: str, limit: int = 200):
 
 def calcular_previsao(registros: List[dict]):
     if not registros:
-        logger.warning("Nenhum registro fornecido para o cálculo.")
+        logger.warning("Nenhum registro para cálculo.")
         return None
     
+    # FILTRAGEM: Manter apenas registros que possuem o campo 'horario'
+    regs_validos = [r for r in registros if 'horario' in r and r['horario']]
+    logger.info(f"Registros com campo 'horario' válido: {len(regs_validos)} de {len(registros)}")
+
+    if not regs_validos:
+        if registros:
+            logger.error(f"Exemplo de campos no primeiro registro: {list(registros[0].keys())}")
+        return None
+
     try:
-        # Ordenação cronológica (do mais antigo para o mais novo)
-        regs = sorted(registros, key=lambda x: x['horario'])
-        logger.info(f"Registros ordenados cronologicamente. Primeiro: {regs[0]['horario']}, Último: {regs[-1]['horario']}")
+        # Ordenação cronológica
+        regs = sorted(regs_validos, key=lambda x: x['horario'])
+        logger.info(f"Ordenação concluída. Primeiro: {regs[0]['horario']}, Último: {regs[-1]['horario']}")
     except Exception as e:
-        logger.error(f"Erro ao ordenar registros: {str(e)}")
+        logger.error(f"Erro fatal na ordenação: {str(e)}")
         return None
 
     # Identificar cateterismos (urineType = 1)
     cateterismos = [i for i, r in enumerate(regs) if r.get('urineType') == 1]
-    logger.info(f"Índices de cateterismo (urineType=1) encontrados: {cateterismos}")
+    logger.info(f"Índices de cateterismo encontrados: {cateterismos}")
     
     if len(cateterismos) < 2:
-        logger.warning(f"Cateterismos insuficientes para média. Encontrados: {len(cateterismos)}")
+        logger.warning(f"Dados insuficientes: {len(cateterismos)} cateterismos encontrados.")
         return None
 
     # Calcular volumes entre cateterismos
@@ -82,79 +92,61 @@ def calcular_previsao(registros: List[dict]):
         idx_start, idx_end = cateterismos[i], cateterismos[i+1]
         vol = sum(float(regs[j].get('quantidadeLiquidoM', 0) or 0) for j in range(idx_start, idx_end))
         intervalos_vol.append(vol)
-        logger.info(f"Intervalo {i}: Volume ingerido entre cateterismo {i} e {i+1} = {vol}ml")
 
     media_vol = sum(intervalos_vol) / len(intervalos_vol)
-    logger.info(f"Média histórica de ingestão entre cateterismos: {media_vol}ml")
     
-    # Calcular ingestão desde o último cateterismo até o momento atual (último registro)
+    # Ingestão desde o último cateterismo
     idx_last_cat = cateterismos[-1]
     vol_desde_ultimo = sum(float(regs[j].get('quantidadeLiquidoM', 0) or 0) for j in range(idx_last_cat, len(regs)))
-    logger.info(f"Volume ingerido desde o último cateterismo: {vol_desde_ultimo}ml")
     
     restante = media_vol - vol_desde_ultimo
-    logger.info(f"Volume restante estimado para o próximo cateterismo: {restante}ml")
     
     try:
-        # Cálculo de tempo baseado na taxa histórica
-        t_last_cat = datetime.fromisoformat(regs[idx_last_cat]['horario'].replace('Z', '+00:00'))
-        t_first_cat = datetime.fromisoformat(regs[cateterismos[0]]['horario'].replace('Z', '+00:00'))
+        # Tratamento de data flexível
+        def parse_date(date_str):
+            return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+
+        t_last_cat = parse_date(regs[idx_last_cat]['horario'])
+        t_first_cat = parse_date(regs[cateterismos[0]]['horario'])
         
-        # Tempo total decorrido entre o primeiro e o último cateterismo do histórico
-        total_sec_historico = (t_last_cat - t_first_cat).total_seconds()
+        total_sec = (t_last_cat - t_first_cat).total_seconds()
         num_intervalos = len(cateterismos) - 1
         
-        if total_sec_historico <= 0:
-            logger.error("Tempo total de histórico inválido (zero ou negativo).")
-            return {"previsao": "Erro no histórico de tempo", "liquido_restante_ml": restante}
+        if total_sec <= 0:
+            return {"previsao": "Erro de cronologia no histórico", "liquido_restante_ml": restante}
         
-        # Média de segundos por intervalo
-        avg_sec_per_interval = total_sec_historico / num_intervalos
-        
-        # Taxa de ingestão (ml por segundo)
-        taxa_ml_sec = media_vol / avg_sec_per_interval
-        logger.info(f"Taxa de ingestão calculada: {taxa_ml_sec} ml/s ({taxa_ml_sec * 3600} ml/h)")
+        taxa_ml_sec = media_vol / (total_sec / num_intervalos)
         
         if taxa_ml_sec <= 0:
-            logger.warning("Taxa de ingestão é zero ou negativa.")
-            return {"previsao": "Taxa de ingestão não calculável", "liquido_restante_ml": restante}
+            return {"previsao": "Taxa de ingestão não detectada", "liquido_restante_ml": restante}
         
-        # Tempo restante em segundos
         sec_restante = restante / taxa_ml_sec
         previsao_hora = t_last_cat + timedelta(seconds=sec_restante)
         
-        logger.info(f"Previsão calculada: {previsao_hora.isoformat()} (em {sec_restante} segundos)")
-
         return {
             "tempo_restante_aprox": str(timedelta(seconds=int(max(0, sec_restante)))),
             "proximo_horario_previsto": previsao_hora.isoformat(),
             "liquido_restante_ml": round(restante, 2),
             "media_historica_ml": round(media_vol, 2),
-            "taxa_ml_hora": round(taxa_ml_sec * 3600, 2),
             "debug": {
-                "total_registros": len(regs),
-                "num_cateterismos": len(cateterismos),
+                "total_processados": len(regs),
+                "cateterismos_encontrados": len(cateterismos),
                 "vol_desde_ultimo": vol_desde_ultimo
             }
         }
     except Exception as e:
-        logger.error(f"Erro durante o cálculo de tempo: {str(e)}")
+        logger.error(f"Erro no cálculo final: {str(e)}")
         return None
 
 @app.get("/prever-cateterismo/{user_id}")
 def prever(user_id: str):
-    logger.info(f"--- Início da requisição para user_id: {user_id} ---")
+    logger.info(f"--- Requisição: {user_id} ---")
     regs = buscar_historico(user_id)
-    
     if not regs:
-        logger.warning(f"Nenhum registro encontrado para o usuário {user_id}")
-        raise HTTPException(status_code=404, detail="Sem registros no DynamoDB para este usuário.")
+        raise HTTPException(status_code=404, detail="Usuário sem registros.")
     
     res = calcular_previsao(regs)
-    
     if not res:
-        logger.warning("Cálculo de previsão retornou None (dados insuficientes).")
-        raise HTTPException(status_code=400, detail="Dados insuficientes para cálculo (necessário pelo menos 2 cateterismos no histórico).")
+        raise HTTPException(status_code=400, detail="Dados insuficientes (necessário pelo menos 2 cateterismos com campo 'horario').")
     
-    logger.info(f"Requisição finalizada com sucesso para {user_id}")
     return res
