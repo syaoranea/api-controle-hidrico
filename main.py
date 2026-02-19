@@ -32,7 +32,7 @@ def healthcheck():
 
 @app.get("/")
 def raiz():
-    return {"mensagem": "API Controle Hidrico Online - Campos Corrigidos"}
+    return {"mensagem": "API Controle Hidrico Online - Debug de urineType"}
 
 def buscar_historico(user_id: str, limit: int = 200):
     logger.info(f"Buscando histórico para o usuário: {user_id}")
@@ -60,27 +60,38 @@ def calcular_previsao(registros: List[dict]):
     if not registros:
         return None
     
-    # Ajuste dos nomes dos campos conforme logs: 'timestamp' e 'quantidadeLiquidoMl'
     campo_data = 'timestamp'
     campo_liquido = 'quantidadeLiquidoMl'
     
     # FILTRAGEM: Manter apenas registros que possuem o campo de data
     regs_validos = [r for r in registros if campo_data in r and r[campo_data]]
-    logger.info(f"Registros com campo '{campo_data}' válido: {len(regs_validos)} de {len(registros)}")
-
+    
     if not regs_validos:
         return None
 
-    try:
-        # Ordenação cronológica
-        regs = sorted(regs_validos, key=lambda x: x[campo_data])
-        logger.info(f"Ordenação concluota. Primeiro: {regs[0][campo_data]}, Último: {regs[-1][campo_data]}")
-    except Exception as e:
-        logger.error(f"Erro na ordenação: {str(e)}")
-        return None
+    # Ordenação cronológica
+    regs = sorted(regs_validos, key=lambda x: x[campo_data])
 
-    # Identificar cateterismos (urineType = 1)
-    cateterismos = [i for i, r in enumerate(regs) if r.get('urineType') == 1]
+    # DEBUG: Inspecionar os valores de urineType nos registros
+    urine_types_encontrados = set()
+    exemplo_urina = None
+    for r in regs:
+        u_type = r.get('urineType')
+        if u_type is not None:
+            urine_types_encontrados.add(f"{u_type} ({type(u_type).__name__})")
+            if u_type == 1 or str(u_type) == "1":
+                exemplo_urina = r
+    
+    logger.info(f"Valores de 'urineType' encontrados no histórico: {list(urine_types_encontrados)}")
+    if not exemplo_urina:
+        # Se não achou 1, vamos ver o que tem em um registro que parece ser de urina
+        for r in regs:
+            if 'quantidadeUrinaMl' in r:
+                logger.info(f"Exemplo de registro de urina: {r}")
+                break
+
+    # Identificar cateterismos (urineType = 1 ou "1")
+    cateterismos = [i for i, r in enumerate(regs) if str(r.get('urineType')) == "1"]
     logger.info(f"Índices de cateterismo encontrados: {cateterismos}")
     
     if len(cateterismos) < 2:
@@ -95,23 +106,17 @@ def calcular_previsao(registros: List[dict]):
         intervalos_vol.append(vol)
 
     media_vol = sum(intervalos_vol) / len(intervalos_vol)
-    
-    # Ingestão desde o último cateterismo
     idx_last_cat = cateterismos[-1]
     vol_desde_ultimo = sum(float(regs[j].get(campo_liquido, 0) or 0) for j in range(idx_last_cat, len(regs)))
-    
     restante = media_vol - vol_desde_ultimo
     
     try:
-        # Tratamento de data flexível
         def parse_date(date_str):
-            # Tenta lidar com timestamps numéricos ou strings ISO
             try:
                 if isinstance(date_str, (int, float)):
                     return datetime.fromtimestamp(date_str)
                 return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
             except:
-                # Fallback para timestamp em milissegundos se for um número muito grande
                 if isinstance(date_str, (int, float)) and date_str > 1e11:
                     return datetime.fromtimestamp(date_str / 1000)
                 raise
@@ -123,12 +128,11 @@ def calcular_previsao(registros: List[dict]):
         num_intervalos = len(cateterismos) - 1
         
         if total_sec <= 0:
-            return {"previsao": "Erro de cronologia no histórico", "liquido_restante_ml": restante}
+            return {"previsao": "Erro de cronologia", "liquido_restante_ml": restante}
         
         taxa_ml_sec = media_vol / (total_sec / num_intervalos)
-        
         if taxa_ml_sec <= 0:
-            return {"previsao": "Taxa de ingestão não detectada", "liquido_restante_ml": restante}
+            return {"previsao": "Taxa zero", "liquido_restante_ml": restante}
         
         sec_restante = restante / taxa_ml_sec
         previsao_hora = t_last_cat + timedelta(seconds=sec_restante)
@@ -139,26 +143,20 @@ def calcular_previsao(registros: List[dict]):
             "liquido_restante_ml": round(restante, 2),
             "media_historica_ml": round(media_vol, 2),
             "debug": {
-                "total_processados": len(regs),
-                "cateterismos_encontrados": len(cateterismos),
-                "vol_desde_ultimo": vol_desde_ultimo,
-                "campo_data_usado": campo_data,
-                "campo_liquido_usado": campo_liquido
+                "cateterismos": len(cateterismos),
+                "urine_types": list(urine_types_encontrados)
             }
         }
     except Exception as e:
-        logger.error(f"Erro no cálculo final: {str(e)}")
+        logger.error(f"Erro cálculo: {str(e)}")
         return None
 
 @app.get("/prever-cateterismo/{user_id}")
 def prever(user_id: str):
-    logger.info(f"--- Requisição: {user_id} ---")
     regs = buscar_historico(user_id)
     if not regs:
         raise HTTPException(status_code=404, detail="Usuário sem registros.")
-    
     res = calcular_previsao(regs)
     if not res:
-        raise HTTPException(status_code=400, detail="Dados insuficientes (necessário pelo menos 2 cateterismos com campo 'timestamp').")
-    
+        raise HTTPException(status_code=400, detail="Dados insuficientes (cateterismos não encontrados). Verifique os logs para ver os valores de urineType.")
     return res
